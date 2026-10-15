@@ -17,8 +17,8 @@ const MENU_EXIT: &str = "tray-exit";
 /// 主窗口的 label，与 `tauri.conf.json` 里的窗口定义一致。
 const MAIN_WINDOW: &str = "main";
 
-/// 把主窗口显示到前台。托盘点击与菜单都用它。
-fn show_main_window(app: &AppHandle) {
+/// 把主窗口显示到前台。托盘点击、托盘菜单与单实例回调都用它。
+pub fn show_main_window(app: &AppHandle) {
     let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
         return;
     };

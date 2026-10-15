@@ -489,7 +489,22 @@ fn validate_params(params: Vec<BuildParam>) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    // 单例运行：第二个进程把命令行参数交给第一个进程后自己退出，这里只负责把主窗口唤回前台。
+    //
+    // 这个插件必须最先注册：插件按注册顺序初始化，而配置里的窗口是在所有插件初始化之后
+    // 才创建的（见 tauri app.rs 的 setup），注册晚了第二个实例会先把窗口弹出来再退出。
+    // 移动端不支持，依赖已经限定在桌面三个平台，这里用 #[cfg(desktop)] 对应上。
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+        eprintln!(
+            "[single-instance] 程序已在运行，第二个实例已退出；参数 {args:?}，工作目录 {cwd}"
+        );
+        tray::show_main_window(app);
+    }));
+
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
