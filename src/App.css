@@ -676,6 +676,65 @@ textarea.input {
   text-decoration: underline;
 }
 
+/* 环境行 + 它的 Jenkins 阶段明细 */
+
+.stage-block {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.pipe-stages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 10px;
+  padding: 2px 0 2px 8px;
+  border-left: 1px dashed var(--border-strong);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.pipe-stage {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.pipe-stage.is-current {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.pipe-stage-mark {
+  font-family: var(--mono);
+}
+
+.ps-ok .pipe-stage-mark {
+  color: var(--ok);
+}
+
+.ps-run .pipe-stage-mark {
+  color: var(--run);
+}
+
+.ps-bad .pipe-stage-mark {
+  color: var(--bad);
+}
+
+.ps-warn .pipe-stage-mark {
+  color: var(--warn);
+}
+
+.pipe-passed {
+  align-self: flex-start;
+  font-size: 11px;
+  color: var(--warn);
+  background: rgba(232, 163, 61, 0.14);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+
 /* ---------- 状态徽章 ---------- */
 
 .badge {
@@ -839,6 +898,14 @@ textarea.input {
 .field > span {
   font-size: 12.5px;
   color: var(--text-dim);
+}
+
+/* 字段下方的补充说明，比字段标签更小一档 */
+.field .field-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  opacity: 0.85;
 }
 
 .field-wide {

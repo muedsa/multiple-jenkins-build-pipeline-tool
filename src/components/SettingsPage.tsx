@@ -34,6 +34,7 @@ function defaultStage(name: string): StageConfig {
     pollIntervalSecs: 5,
     timeoutMinutes: 90,
     abortOnFailure: false,
+    passOnStage: "",
   };
 }
 
@@ -158,6 +159,14 @@ function StageForm({
           <span className="stage-url">{draft.baseUrl || "未配置地址"}</span>
         </button>
         <div className="stage-badges">
+          {draft.passOnStage.trim() && (
+            <span
+              className="pill"
+              title={`阶段「${draft.passOnStage.trim()}」一成功，本级就算通过并进入下一环境`}
+            >
+              阶段放行：{draft.passOnStage.trim()}
+            </span>
+          )}
           {draft.abortOnFailure && (
             <span className="pill pill-warn" title="本级失败后中止整条流水线">
               失败即中止
@@ -264,6 +273,21 @@ function StageForm({
                   patch({ timeoutMinutes: Number(e.currentTarget.value) || 90 })
                 }
               />
+            </label>
+            <label className="field field-wide">
+              <span>命中此阶段即算本级成功（忽略后续 stage）</span>
+              <input
+                className="input"
+                value={draft.passOnStage}
+                onChange={(e) => patch({ passOnStage: e.currentTarget.value })}
+                placeholder="留空 = 按整条构建的结果判定；例如 Deploy"
+              />
+              <span className="field-hint">
+                填 Jenkins Pipeline 里某个 stage 的名字（不区分大小写）。它一成功，本级就算通过，
+                直接开始下一个环境的构建，不等后面的 stage 跑完。
+                Jenkins 上正在跑的构建<strong>不会被中断</strong>。
+                阶段信息来自 Pipeline Stage View 插件，取不到时自动退回按整条构建结果判定。
+              </span>
             </label>
           </div>
 

@@ -41,6 +41,21 @@ export interface StageConfig {
   timeoutMinutes: number;
   /** 本级失败后是否中止整条流水线（后面所有级都不再执行）。 */
   abortOnFailure: boolean;
+  /**
+   * 「命中即放行」的 Jenkins Pipeline 阶段名。
+   * 该阶段一成功就算本级成功，直接进下一级，不等后面的阶段跑完。
+   * 留空表示按整条构建的结果判定。
+   */
+  passOnStage: string;
+}
+
+/** Jenkins Pipeline 的一个阶段（来自 Pipeline Stage View 插件的 wfapi）。 */
+export interface PipelineStage {
+  name: string;
+  /** 原样保留 Jenkins 的状态串。 */
+  status: string;
+  /** 该阶段耗时（秒），进行中或未跑到时为 0。 */
+  durationSecs: number;
 }
 
 /** 某个环境是否已经存好 token。 */
@@ -77,6 +92,12 @@ export interface StageRun {
   error: string | null;
   startedAt: string | null;
   finishedAt: string | null;
+  /** Jenkins Pipeline 的各阶段进度；拿不到时为空数组。 */
+  pipelineStages: PipelineStage[];
+  /** 当前跑到的阶段名。 */
+  currentStage: string | null;
+  /** 本级靠哪个阶段「命中即放行」通过的；未启用时为 null。 */
+  passedOnStage: string | null;
 }
 
 /** 队列里的一条发布任务：一个服务 × 一条流水线。 */
@@ -170,6 +191,16 @@ export const STATUS_LABEL: Record<StageStatus, string> = {
   failed: "失败",
   skipped: "已跳过",
   cancelled: "已取消",
+};
+
+/** Jenkins 阶段状态的中文文案与符号。状态串来自 wfapi，未知值原样显示。 */
+export const PIPELINE_STATUS: Record<string, { label: string; mark: string }> = {
+  SUCCESS: { label: "成功", mark: "✓" },
+  IN_PROGRESS: { label: "进行中", mark: "●" },
+  FAILED: { label: "失败", mark: "✕" },
+  ABORTED: { label: "已中断", mark: "⊘" },
+  NOT_EXECUTED: { label: "未执行", mark: "○" },
+  PAUSED_PENDING_INPUT: { label: "等待确认", mark: "⏸" },
 };
 
 /** 是否已经结束（不会再变化）。 */

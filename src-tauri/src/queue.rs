@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 use crate::config::{AppConfig, BuildParam, StageConfig};
-use crate::jenkins::JenkinsClient;
+use crate::jenkins::{
+    current_stage, BuildOutcome, JenkinsClient, PipelineStage,
+};
 use crate::notify::{build_content, humanize_duration, send_system_notification, TemplateVars};
 
 /// 通知内容类型对测试与验证程序可见（[`Sink`] 会用到它）。
@@ -65,6 +67,12 @@ pub struct StageRun {
     pub error: Option<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    /// Jenkins Pipeline 的各阶段进度。拿不到（没装插件、FreeStyle Job）时为空。
+    pub pipeline_stages: Vec<PipelineStage>,
+    /// 当前跑到哪个阶段，取自 [`pipeline_stages`]，方便界面直接显示。
+    pub current_stage: Option<String>,
+    /// 本级是靠哪个阶段「命中即放行」通过的；没启用时为空。
+    pub passed_on_stage: Option<String>,
 }
 
 impl StageRun {
@@ -78,6 +86,9 @@ impl StageRun {
             error: None,
             started_at: None,
             finished_at: None,
+            pipeline_stages: Vec::new(),
+            current_stage: None,
+            passed_on_stage: None,
         }
     }
 }
@@ -645,7 +656,7 @@ fn task_snapshot(registry: &Arc<QueueRegistry>, task_id: &str) -> Option<Task> {
         .cloned()
 }
 
-/// 执行某个环境上的一次构建：触发 -> 等分配构建号 -> 等结束。
+/// 执行某个环境上的一次构建：触发 -> 等分配构建号 -> 等结束（或命中阶段提前放行）。
 async fn run_stage(
     ctx: &Arc<QueueCtx>,
     task_id: &str,
@@ -709,11 +720,90 @@ async fn run_stage(
     ctx.log(Some(task_id), "info", format!("{tag}：开始执行 #{build_number}"));
     ctx.emit();
 
-    match client
-        .wait_for_build(service, build_number, poll, timeout, |_| {})
-        .await
-    {
-        Ok(status) => {
+    // 「命中即放行」：环境上填了阶段名，该阶段一成功就算本级通过，不等后面的阶段。
+    let target = {
+        let name = stage_cfg.pass_on_stage.trim();
+        (!name.is_empty()).then(|| name.to_string())
+    };
+    let wait_started = std::time::Instant::now();
+    let mut last_sig = String::new();
+    let mut last_stage: Option<String> = None;
+    let mut warned = false;
+
+    let outcome = client
+        .wait_for_build(
+            service,
+            build_number,
+            poll,
+            timeout,
+            target.as_deref(),
+            |_status, progress| {
+                // 阶段接口不可用只在真的配了放行条件时提醒一次，免得刷屏。
+                if !warned && target.is_some() {
+                    if let Some(reason) = progress.unavailable.as_deref() {
+                        warned = true;
+                        ctx.log(
+                            Some(task_id),
+                            "warn",
+                            format!("{tag}：拿不到阶段信息（{reason}），本级改按整条构建结果判定"),
+                        );
+                        ctx.emit();
+                    }
+                }
+                // 按整个列表的签名比较：状态变了就该刷新，否则最后一轮可能停在「进行中」。
+                let sig = stage_signature(&progress.stages);
+                if sig == last_sig {
+                    return;
+                }
+                last_sig = sig;
+                let stages = progress.stages.clone();
+                let current = current_stage(&stages).map(|s| s.name.clone());
+                ctx.with_task(task_id, |t| {
+                    if let Some(s) = t.stage_mut(env) {
+                        s.pipeline_stages = stages;
+                        s.current_stage = current.clone();
+                    }
+                });
+                // 阶段一挪动就记一行，回看时能定位卡在哪一步。
+                if current != last_stage {
+                    last_stage = current;
+                    if let Some(name) = last_stage.as_deref() {
+                        ctx.log(Some(task_id), "info", format!("{tag}：阶段「{name}」"));
+                    }
+                }
+                ctx.emit();
+            },
+        )
+        .await;
+
+    match outcome {
+        Ok(BuildOutcome::EarlyPassed { stage, status }) => {
+            // 构建还没结束，Jenkins 给的 duration 不可用，改用我们实际等了多久。
+            let waited = wait_started.elapsed().as_secs();
+            ctx.with_task(task_id, |t| {
+                if let Some(s) = t.stage_mut(env) {
+                    s.status = StageStatus::Success;
+                    s.build_number = Some(status.build_number);
+                    if !status.url.is_empty() {
+                        s.url = status.url.clone();
+                    }
+                    s.duration_secs = waited;
+                    s.passed_on_stage = Some(stage.clone());
+                    s.finished_at =
+                        Some(chrono::Local::now().format("%H:%M:%S").to_string());
+                }
+            });
+            ctx.log(
+                Some(task_id),
+                "success",
+                format!(
+                    "{tag}：阶段「{stage}」已成功，忽略后续阶段直接放行（Jenkins #{build_number} 继续跑，本工具不中断它）"
+                ),
+            );
+            ctx.emit();
+            true
+        }
+        Ok(BuildOutcome::Finished(status)) => {
             let ok = status.state.is_success();
             ctx.with_task(task_id, |t| {
                 if let Some(s) = t.stage_mut(env) {
@@ -780,6 +870,15 @@ fn mark_failed(
             s.finished_at = Some(chrono::Local::now().format("%H:%M:%S").to_string());
         }
     });
+}
+
+/// 阶段列表的签名：任一阶段的名字或状态变了就会不一样。
+/// 轮询时靠它决定「要不要刷新界面、要不要记日志」，免得每轮都发一次事件。
+fn stage_signature(stages: &[PipelineStage]) -> String {
+    stages
+        .iter()
+        .map(|s| format!("{}={};", s.name, s.status))
+        .collect()
 }
 
 /// 为**单个任务**组装通知模板变量。
@@ -875,6 +974,34 @@ mod tests {
 
     fn stage(name: &str) -> StageConfig {
         StageConfig::new(name)
+    }
+
+    fn ps(name: &str, status: &str) -> PipelineStage {
+        PipelineStage {
+            name: name.to_string(),
+            status: status.to_string(),
+            duration_secs: 0,
+        }
+    }
+
+    /// 轮询时靠签名决定要不要刷新界面：名字或状态变了才算变。
+    #[test]
+    fn stage_signature_detects_stage_changes() {
+        assert_eq!(stage_signature(&[]), "", "空列表的签名是空串");
+
+        let before = vec![ps("Build", "SUCCESS"), ps("Deploy", "IN_PROGRESS")];
+        let same = vec![ps("Build", "SUCCESS"), ps("Deploy", "IN_PROGRESS")];
+        assert_eq!(stage_signature(&before), stage_signature(&same));
+
+        let finished = vec![ps("Build", "SUCCESS"), ps("Deploy", "SUCCESS")];
+        assert_ne!(
+            stage_signature(&before),
+            stage_signature(&finished),
+            "阶段跑完了必须刷新，否则界面还停在「进行中」"
+        );
+
+        let renamed = vec![ps("Build", "SUCCESS"), ps("Publish", "IN_PROGRESS")];
+        assert_ne!(stage_signature(&before), stage_signature(&renamed));
     }
 
     /// 单级判定：上一级失败且开了中止才截断，否则继续推进。

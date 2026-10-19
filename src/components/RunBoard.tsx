@@ -1,5 +1,10 @@
 import type { StageRun, StageStatus, Task } from "../types";
-import { STATUS_LABEL, humanizeDuration, isTerminal } from "../types";
+import {
+  PIPELINE_STATUS,
+  STATUS_LABEL,
+  humanizeDuration,
+  isTerminal,
+} from "../types";
 
 /** 状态徽章。 */
 export function StatusBadge({
@@ -17,30 +22,82 @@ export function StatusBadge({
   );
 }
 
+/** 阶段状态对应的配色 class。 */
+const PIPELINE_TONE: Record<string, string> = {
+  SUCCESS: "ok",
+  IN_PROGRESS: "run",
+  FAILED: "bad",
+  ABORTED: "warn",
+  PAUSED_PENDING_INPUT: "warn",
+};
+
+/** Jenkins Pipeline 的阶段明细。拿不到（没装插件、FreeStyle Job）时不渲染。 */
+function PipelineStrip({ stage }: { stage: StageRun }) {
+  if (stage.pipelineStages.length === 0) return null;
+  return (
+    <div
+      className="pipe-stages"
+      title="Jenkins Pipeline 各阶段进度（来自 Pipeline Stage View 插件）"
+    >
+      {stage.pipelineStages.map((item, index) => {
+        const meta = PIPELINE_STATUS[item.status] ?? { label: item.status, mark: "•" };
+        const tone = PIPELINE_TONE[item.status] ?? "idle";
+        const current = stage.currentStage === item.name;
+        return (
+          <span
+            key={`${item.name}-${index}`}
+            className={`pipe-stage ps-${tone}${current ? " is-current" : ""}`}
+            title={`${item.name}：${meta.label}`}
+          >
+            <span className="pipe-stage-mark">{meta.mark}</span>
+            {item.name}
+            {item.durationSecs > 0 && (
+              <span className="pipe-stage-time">{humanizeDuration(item.durationSecs)}</span>
+            )}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 /** 单条环境流水线。 */
 function StageRow({ stage }: { stage: StageRun }) {
   const isLink = stage.url.startsWith("http");
   return (
-    <div className={`stage stage-${stage.status}`}>
-      <span className="stage-env">{stage.env}</span>
-      <StatusBadge status={stage.status} size="small" />
-      <span className="stage-meta">
-        {stage.buildNumber != null && <span className="mono">#{stage.buildNumber}</span>}
-        {stage.durationSecs > 0 && <span>{humanizeDuration(stage.durationSecs)}</span>}
-        {stage.status === "running" && stage.startedAt && (
-          <span className="muted">开始于 {stage.startedAt}</span>
+    <div className="stage-block">
+      <div className={`stage stage-${stage.status}`}>
+        <span className="stage-env">{stage.env}</span>
+        <StatusBadge status={stage.status} size="small" />
+        <span className="stage-meta">
+          {stage.buildNumber != null && <span className="mono">#{stage.buildNumber}</span>}
+          {stage.durationSecs > 0 && <span>{humanizeDuration(stage.durationSecs)}</span>}
+          {stage.status === "running" && stage.startedAt && (
+            <span className="muted">开始于 {stage.startedAt}</span>
+          )}
+        </span>
+        {isLink && (
+          <a
+            className="stage-link"
+            href={stage.url}
+            target="_blank"
+            rel="noreferrer"
+            title="在浏览器中打开构建页面"
+          >
+            日志 ↗
+          </a>
         )}
-      </span>
-      {isLink && (
-        <a
-          className="stage-link"
-          href={stage.url}
-          target="_blank"
-          rel="noreferrer"
-          title="在浏览器中打开构建页面"
+      </div>
+
+      <PipelineStrip stage={stage} />
+
+      {stage.passedOnStage && (
+        <span
+          className="pipe-passed"
+          title="命中该阶段即算本级成功；Jenkins 上的构建仍在继续，本工具不会中断它"
         >
-          日志 ↗
-        </a>
+          按阶段「{stage.passedOnStage}」提前放行
+        </span>
       )}
     </div>
   );

@@ -1,8 +1,8 @@
 //! 针对 Jenkins REST 交互的集成测试。
 //!
 //! 这里跑一个最小的假 Jenkins，用来验证真实流程里的关键环节：
-//! 取 CSRF crumb、带参数触发构建、从队列项解析构建号、轮询直到结束，
-//! 以及各种失败路径（401 / 404 / 构建失败 / 超时）。
+//! 取 CSRF crumb、带参数触发构建、从队列项解析构建号、轮询直到结束、
+//! 读取 Pipeline 阶段与「命中阶段提前放行」，以及各种失败路径（401 / 404 / 构建失败 / 超时）。
 //!
 //! 需要写系统凭据管理器的用例默认跳过，见 [`skip_without_keyring`]。
 
@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jenkins_build_pipeline_tool_lib::config::StageConfig;
-use jenkins_build_pipeline_tool_lib::jenkins::{BuildState, JenkinsClient};
+use jenkins_build_pipeline_tool_lib::jenkins::{
+    current_stage, stage_succeeded, BuildOutcome, BuildState, BuildStatus, JenkinsClient,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -30,6 +32,11 @@ struct FakeJenkins {
     final_result: Option<String>,
     /// 是否返回 crumb。
     with_crumb: bool,
+    /// 是否提供 `wfapi/describe`（相当于装了 Pipeline Stage View 插件）。
+    with_stages: bool,
+    /// 第几次查询阶段列表时，`Deploy` 阶段才变成 SUCCESS。0 表示一开始就成功。
+    /// 用来模拟「某个阶段先跑完、整条构建还在继续」。
+    stage_ready_after: usize,
 }
 
 /// 假服务器的运行状态。
@@ -39,6 +46,8 @@ struct FakeState {
     queue_hits: AtomicUsize,
     /// 构建状态被查询过几次。
     build_hits: AtomicUsize,
+    /// 阶段列表（wfapi/describe）被查询过几次。
+    stage_hits: AtomicUsize,
     /// 记录收到过的请求路径，便于断言。
     requests: std::sync::Mutex<Vec<String>>,
     /// 记录触发请求的表单体。
@@ -55,6 +64,7 @@ async fn start_fake(config: FakeJenkins, expected_auth: &str) -> (String, Arc<Fa
         config,
         queue_hits: AtomicUsize::new(0),
         build_hits: AtomicUsize::new(0),
+        stage_hits: AtomicUsize::new(0),
         requests: std::sync::Mutex::new(Vec::new()),
         trigger_body: std::sync::Mutex::new(String::new()),
         expected_auth: expected_auth.to_string(),
@@ -225,6 +235,32 @@ async fn serve(mut stream: TcpStream, state: Arc<FakeState>) -> std::io::Result<
             );
             (200, ct, b)
         }
+    } else if route.starts_with("/job/demo/42/wfapi/describe") {
+        if !state.config.with_stages {
+            // 没装 Pipeline Stage View 插件时就是这个样子。
+            (404, "text/plain".to_string(), "no wfapi".to_string())
+        } else {
+            let hits = state.stage_hits.fetch_add(1, Ordering::SeqCst);
+            let deploy = if hits + 1 >= state.config.stage_ready_after.max(1) {
+                "SUCCESS"
+            } else {
+                "IN_PROGRESS"
+            };
+            let verify = if deploy == "SUCCESS" {
+                "IN_PROGRESS"
+            } else {
+                "NOT_EXECUTED"
+            };
+            let (ct, b) = json(&format!(
+                r####"{{"stages":[
+                  {{"id":"3","name":"Checkout","status":"SUCCESS","startTimeMillis":1,"durationMillis":2000}},
+                  {{"id":"6","name":"Build","status":"SUCCESS","startTimeMillis":3,"durationMillis":8000}},
+                  {{"id":"9","name":"Deploy","status":"{deploy}","startTimeMillis":11,"durationMillis":0}},
+                  {{"id":"12","name":"Verify","status":"{verify}","startTimeMillis":0,"durationMillis":0}}
+                ]}}"####
+            ));
+            (200, ct, b)
+        }
     } else if route.starts_with("/job/demo/lastBuild/api/json") {
         let (ct, b) = json(
             r####"{"number":41,"building":false,"result":"SUCCESS","duration":12000,"url":"http://x/job/demo/41/","displayName":"#41"}"####,
@@ -377,6 +413,27 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+/// 走一遍等待循环，并断言走的是「整条构建跑完」这条路径。
+async fn wait_finished(client: &JenkinsClient, pass_on_stage: Option<&str>) -> BuildStatus {
+    match client
+        .wait_for_build(
+            "demo",
+            42,
+            Duration::from_millis(20),
+            Duration::from_secs(10),
+            pass_on_stage,
+            |_, _| {},
+        )
+        .await
+        .expect("等待构建结束")
+    {
+        BuildOutcome::Finished(status) => status,
+        BuildOutcome::EarlyPassed { stage, .. } => {
+            panic!("不该走提前放行（命中阶段「{stage}」）")
+        }
+    }
+}
+
 /// 完整跑一遍 dev 侧流程：触发 -> 排队 -> 执行 -> 成功。
 #[tokio::test]
 async fn full_build_flow_succeeds() {
@@ -430,16 +487,7 @@ async fn full_build_flow_succeeds() {
         .expect("应当拿到构建号");
     assert_eq!(build_number, 42);
 
-    let status = client
-        .wait_for_build(
-            "demo",
-            42,
-            Duration::from_millis(20),
-            Duration::from_secs(10),
-            |_| {},
-        )
-        .await
-        .expect("等待构建结束");
+    let status = wait_finished(&client, None).await;
     assert_eq!(status.state, BuildState::Success);
     assert!(status.state.is_success());
     assert_eq!(status.build_number, 42);
@@ -617,16 +665,7 @@ async fn failed_build_reports_failure() {
 
     let config = config_for("inttest-fail", &base, token);
     let client = JenkinsClient::new(&config).expect("构造客户端");
-    let status = client
-        .wait_for_build(
-            "demo",
-            42,
-            Duration::from_millis(20),
-            Duration::from_secs(10),
-            |_| {},
-        )
-        .await
-        .expect("查询构建状态");
+    let status = wait_finished(&client, None).await;
     assert_eq!(status.state, BuildState::Failure);
     assert!(!status.state.is_success());
     assert_eq!(status.state.label(), "失败");
@@ -654,16 +693,7 @@ async fn unstable_build_is_not_success() {
 
     let config = config_for("inttest-unstable", &base, token);
     let client = JenkinsClient::new(&config).expect("构造客户端");
-    let status = client
-        .wait_for_build(
-            "demo",
-            42,
-            Duration::from_millis(20),
-            Duration::from_secs(10),
-            |_| {},
-        )
-        .await
-        .expect("查询构建状态");
+    let status = wait_finished(&client, None).await;
     assert_eq!(status.state, BuildState::Unstable);
     assert!(!status.state.is_success());
 
@@ -900,3 +930,140 @@ async fn plain_job_triggers_without_parameters() {
     cleanup("inttest-plain");
 }
 
+
+/// 装了 Pipeline Stage View 时，能拿到各阶段的名字、状态与耗时。
+#[tokio::test]
+async fn describe_stages_returns_pipeline_stages() {
+    if skip_without_keyring() {
+        return;
+    }
+    let token = "inttest-token-stages";
+    let (base, _state) = start_fake(
+        FakeJenkins {
+            queue_ready_after: 1,
+            build_finishes_after: 1,
+            with_stages: true,
+            // 第 3 次查询 Deploy 才算成功，这里只查一次，应当还在跑。
+            stage_ready_after: 3,
+            ..Default::default()
+        },
+        &basic_auth(token),
+    )
+    .await;
+
+    let config = config_for("inttest-stages", &base, token);
+    let client = JenkinsClient::new(&config).expect("构造客户端");
+
+    let stages = client
+        .describe_stages("demo", 42)
+        .await
+        .expect("读阶段列表");
+    let names: Vec<&str> = stages.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["Checkout", "Build", "Deploy", "Verify"]);
+    assert_eq!(stages[1].duration_secs, 8, "8000ms 应当换算成 8 秒");
+    assert_eq!(
+        current_stage(&stages).map(|s| s.name.as_str()),
+        Some("Deploy"),
+        "当前阶段应当是正在跑的 Deploy"
+    );
+    assert!(
+        !stage_succeeded(&stages, "Deploy"),
+        "Deploy 还没成功，不该放行"
+    );
+
+    cleanup("inttest-stages");
+}
+
+/// 命中阶段就提前放行，哪怕整条构建还在跑、最终会失败。
+#[tokio::test]
+async fn early_pass_when_target_stage_succeeds() {
+    if skip_without_keyring() {
+        return;
+    }
+    let token = "inttest-token-early";
+    let (base, state) = start_fake(
+        FakeJenkins {
+            queue_ready_after: 1,
+            // 构建故意一直不结束，并且最终结论是 FAILURE：
+            // 放行必须只看 Deploy 的结果，后面的 Verify 根本不参与。
+            build_finishes_after: 99,
+            final_result: Some("FAILURE".to_string()),
+            with_stages: true,
+            stage_ready_after: 2,
+            ..Default::default()
+        },
+        &basic_auth(token),
+    )
+    .await;
+
+    let config = config_for("inttest-early", &base, token);
+    let client = JenkinsClient::new(&config).expect("构造客户端");
+
+    // 用小写传目标阶段，顺便验证匹配不区分大小写。
+    let outcome = client
+        .wait_for_build(
+            "demo",
+            42,
+            Duration::from_millis(20),
+            Duration::from_secs(10),
+            Some("deploy"),
+            |_, _| {},
+        )
+        .await
+        .expect("等待构建");
+    match outcome {
+        BuildOutcome::EarlyPassed { stage, status } => {
+            // 用户填的是小写，回报的应当是 Jenkins 里实际的阶段名。
+            assert_eq!(stage, "Deploy");
+            assert_eq!(status.build_number, 42);
+        }
+        BuildOutcome::Finished(status) => {
+            panic!("构建还没结束，不该走完整结论路径：{:?}", status.state)
+        }
+    }
+    assert_eq!(
+        state.stage_hits.load(Ordering::SeqCst),
+        2,
+        "应当在第二次查到阶段时放行"
+    );
+
+    cleanup("inttest-early");
+}
+
+/// 没装插件时只打一次阶段接口，之后按整条构建结果判定。
+#[tokio::test]
+async fn missing_stage_view_falls_back_to_build_result() {
+    if skip_without_keyring() {
+        return;
+    }
+    let token = "inttest-token-nostage";
+    let (base, state) = start_fake(
+        FakeJenkins {
+            queue_ready_after: 1,
+            build_finishes_after: 3,
+            with_stages: false,
+            ..Default::default()
+        },
+        &basic_auth(token),
+    )
+    .await;
+
+    let config = config_for("inttest-nostage", &base, token);
+    let client = JenkinsClient::new(&config).expect("构造客户端");
+
+    let status = wait_finished(&client, Some("Deploy")).await;
+    assert_eq!(status.state, BuildState::Success);
+
+    let requests = state.requests.lock().unwrap().clone();
+    let wfapi_calls = requests.iter().filter(|p| p.contains("wfapi")).count();
+    assert_eq!(
+        wfapi_calls, 1,
+        "阶段接口 404 之后不该反复打，实际请求：{requests:?}"
+    );
+    assert!(
+        state.build_hits.load(Ordering::SeqCst) >= 3,
+        "降级后仍应正常轮询构建状态"
+    );
+
+    cleanup("inttest-nostage");
+}

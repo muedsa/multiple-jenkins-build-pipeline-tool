@@ -6,6 +6,8 @@
 //! - `POST /job/{name}/buildWithParameters` 或 `POST /job/{name}/build` 触发构建
 //! - `GET  /queue/item/{id}/api/json`      由队列项解析出真正的构建号
 //! - `GET  /job/{name}/{n}/api/json`       查询构建状态
+//! - `GET  /job/{name}/{n}/wfapi/describe` 查询 Pipeline 各阶段进度
+//!   （**不是原生接口**，由 Pipeline Stage View 插件提供；没有插件就当没有这个信息）
 //!
 //! 队列项 -> 构建号 这一步是必须的：Jenkins 的 `queueItem` 头只给出队列地址，
 //! 构建号要等排队结束后才会出现在 `executable.number` 里。
@@ -83,6 +85,75 @@ pub struct BuildStatus {
     /// 构建显示名。目前界面没用到，但保留下来方便以后展示「#12 (redeploy)」这类名字。
     #[allow(dead_code)]
     pub display_name: String,
+}
+
+/// Jenkins Pipeline 的一个阶段。
+///
+/// 状态串原样保留，方便界面按值配色：`SUCCESS` / `IN_PROGRESS` / `FAILED` /
+/// `NOT_EXECUTED` / `ABORTED` / `PAUSED_PENDING_INPUT`（等人工确认）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineStage {
+    pub name: String,
+    pub status: String,
+    /// 该阶段耗时（秒）。进行中或没跑到的阶段为 0。
+    pub duration_secs: u64,
+}
+
+/// 轮询构建时一并回报的阶段信息。
+#[derive(Debug, Clone, Default)]
+pub struct StageProgress {
+    /// 阶段列表；拿不到（没装插件、FreeStyle Job）时为空。
+    pub stages: Vec<PipelineStage>,
+    /// 只填一次：取不到阶段列表的原因。置了这个就不再反复请求该接口。
+    pub unavailable: Option<String>,
+}
+
+/// 等待构建的两种结局。
+#[derive(Debug, Clone)]
+pub enum BuildOutcome {
+    /// 整条构建跑完了，按 Jenkins 的 result 判定。
+    Finished(BuildStatus),
+    /// 「命中即放行」生效：目标阶段已成功，后面的阶段不再等。
+    /// 构建本身在 Jenkins 上继续跑，工具只是不去看它了。
+    EarlyPassed {
+        /// 放行那一刻的构建状态（`building` 通常还是 true）。
+        status: BuildStatus,
+        /// 命中的阶段名。
+        stage: String,
+    },
+}
+
+/// 目标阶段是否已经成功。
+///
+/// 名字去掉首尾空格后**不区分大小写**全等匹配（Jenkins 的 stage 名是用户自己写的，
+/// 大小写经常和文档不一致）；只有 `SUCCESS` 算成功。
+pub fn stage_succeeded(stages: &[PipelineStage], target: &str) -> bool {
+    matched_success_stage(stages, target).is_some()
+}
+
+/// 找出已成功的目标阶段，返回 Jenkins 给的那份（名字大小写以 Jenkins 为准，
+/// 便于界面上显示用户实际写的写法而不是他手输的那份）。
+pub fn matched_success_stage<'a>(
+    stages: &'a [PipelineStage],
+    target: &str,
+) -> Option<&'a PipelineStage> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    stages
+        .iter()
+        .find(|s| s.name.trim().eq_ignore_ascii_case(target) && s.status == "SUCCESS")
+}
+
+/// 当前所处阶段：优先取正在跑的那个，没有就取最后一个已有结论的，
+/// 好让界面任何时候都能显示「跑到哪儿了」。
+pub fn current_stage(stages: &[PipelineStage]) -> Option<&PipelineStage> {
+    stages
+        .iter()
+        .find(|s| matches!(s.status.as_str(), "IN_PROGRESS" | "PAUSED_PENDING_INPUT"))
+        .or_else(|| stages.iter().rev().find(|s| s.status != "NOT_EXECUTED"))
 }
 
 /// Jenkins 服务器返回的错误，区分「没登录」「没权限」「找不到 Job」以便给出可操作提示。
@@ -526,22 +597,75 @@ impl JenkinsClient {
         })
     }
 
-    /// 等待构建结束，期间按 `poll_interval` 轮询。
+    /// 查询某次构建的 Pipeline 阶段列表。
+    ///
+    /// 走的是 Pipeline Stage View 插件的 `wfapi/describe`，**不是 Jenkins 原生接口**，
+    /// 没装插件时返回 404，由调用方降级处理。
+    pub async fn describe_stages(
+        &self,
+        job: &str,
+        build_number: u64,
+    ) -> Result<Vec<PipelineStage>, JenkinsError> {
+        let path = format!("{}/{}/wfapi/describe", Self::job_path(job), build_number);
+        let response = self
+            .client
+            .get(self.url(&path))
+            .basic_auth(&self.username, Some(&self.token))
+            .send()
+            .await
+            .map_err(|e| JenkinsError::Transport(e.to_string()))?;
+        let info: WfapiRun = self
+            .handle(response, || format!("构建 {job}#{build_number} 的阶段列表"))
+            .await?;
+
+        Ok(parse_wfapi_stages(info))
+    }
+
+    /// 等待构建结束，期间按 `poll_interval` 同时轮询构建状态与阶段列表。
+    ///
+    /// `pass_on_stage` 非空时，一旦同名阶段成功就立刻返回 [`BuildOutcome::EarlyPassed`]，
+    /// 后面的阶段不再等（Jenkins 上的构建照旧跑完，工具不去中断它）。
+    /// 阶段接口取不到数据时降级成只看构建结果，并且只试一次，不每轮都打。
     pub async fn wait_for_build(
         &self,
         job: &str,
         build_number: u64,
         poll_interval: Duration,
         timeout: Duration,
-        mut on_progress: impl FnMut(&BuildStatus),
-    ) -> Result<BuildStatus, JenkinsError> {
+        pass_on_stage: Option<&str>,
+        mut on_progress: impl FnMut(&BuildStatus, &StageProgress),
+    ) -> Result<BuildOutcome, JenkinsError> {
+        let target = pass_on_stage
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut progress = StageProgress::default();
         loop {
             let status = self.build_status(job, build_number).await?;
-            if status.state.is_finished() {
-                return Ok(status);
+            if progress.unavailable.is_none() {
+                match self.describe_stages(job, build_number).await {
+                    Ok(stages) => progress.stages = stages,
+                    Err(err) => {
+                        progress.stages.clear();
+                        progress.unavailable = Some(stage_unavailable_reason(&err));
+                    }
+                }
             }
-            on_progress(&status);
+            // 每轮都先回报一次（含最后一轮），保证界面拿到的阶段列表和结论是同步的。
+            on_progress(&status, &progress);
+            // 命中即放行：不管整条构建跑没跑完，本级都算成功。
+            if let Some(target) = target.as_deref() {
+                if let Some(hit) = matched_success_stage(&progress.stages, target) {
+                    return Ok(BuildOutcome::EarlyPassed {
+                        status,
+                        stage: hit.name.clone(),
+                    });
+                }
+            }
+            if status.state.is_finished() {
+                return Ok(BuildOutcome::Finished(status));
+            }
             if tokio::time::Instant::now() >= deadline {
                 return Err(JenkinsError::Timeout(format!(
                     "构建 {job}#{build_number} 超过 {} 分钟仍未结束",
@@ -718,6 +842,61 @@ struct BuildInfo {
     display_name: Option<String>,
 }
 
+// ---- `wfapi/describe` 的响应结构（Pipeline Stage View 插件） ----
+
+#[derive(Debug, Deserialize)]
+struct WfapiRun {
+    #[serde(default)]
+    stages: Vec<WfapiStage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WfapiStage {
+    /// 并行块等情况下可能没有名字，这种条目直接丢掉。
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default, rename = "durationMillis")]
+    duration_millis: Option<u64>,
+}
+
+/// 把 `wfapi/describe` 的响应整理成界面要用的阶段列表。
+///
+/// 没有名字的条目（并行块的壳）直接丢掉；耗时从毫秒换算成秒。
+fn parse_wfapi_stages(run: WfapiRun) -> Vec<PipelineStage> {
+    run.stages
+        .into_iter()
+        .filter_map(|s| {
+            let name = s.name?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            Some(PipelineStage {
+                name,
+                status: s.status.unwrap_or_else(|| "UNKNOWN".to_string()),
+                duration_secs: s.duration_millis.unwrap_or(0) / 1000,
+            })
+        })
+        .collect()
+}
+
+/// 「拿不到阶段信息」的简短原因，用括号嵌进日志里，所以不要带环境前缀。
+fn stage_unavailable_reason(err: &JenkinsError) -> String {
+    match err {
+        // 404 基本就等于「插件没装」，这是最常见的情况，值得说清楚。
+        JenkinsError::NotFound(_) => {
+            "这台 Jenkins 没有 wfapi 接口，多半是未安装 Pipeline Stage View 插件".to_string()
+        }
+        JenkinsError::Unauthorized => "认证失败".to_string(),
+        JenkinsError::Forbidden => "权限不足".to_string(),
+        JenkinsError::Transport(e) => format!("连不上：{e}"),
+        JenkinsError::Decode(e) => format!("响应解析失败：{e}"),
+        JenkinsError::Http(code, _) => format!("HTTP {code}"),
+        JenkinsError::Timeout(e) => e.clone(),
+    }
+}
+
 /// 对 Job 名里的单段做 URL 转义。
 ///
 /// 只保留 URL 里安全的字符，其余按 UTF-8 百分号编码，
@@ -847,6 +1026,123 @@ mod tests {
         assert_eq!(
             BuildState::from_result(Some("FAILURE")),
             BuildState::Failure
+        );
+    }
+
+    fn stage(name: &str, status: &str) -> PipelineStage {
+        PipelineStage {
+            name: name.to_string(),
+            status: status.to_string(),
+            duration_secs: 0,
+        }
+    }
+
+    /// 真实 wfapi 响应字段很多（`_links`、`id`、外层结论等），解析只认自己要用的那几个。
+    #[test]
+    fn wfapi_payload_is_parsed_into_stages() {
+        let raw = r####"{
+          "id": "2014-10-16_13-07-52",
+          "name": "#16",
+          "status": "PAUSED_PENDING_INPUT",
+          "_links": { "self": { "href": "/jenkins/job/x/16/wfapi/describe" } },
+          "stages": [
+            { "_links": {}, "id": "5", "name": "Build", "status": "SUCCESS",
+              "startTimeMillis": 1413461275770, "durationMillis": 5228 },
+            { "id": "8", "name": " Test ", "status": null, "durationMillis": 4994 },
+            { "id": "9", "status": "SUCCESS", "durationMillis": 1000 },
+            { "id": "10", "name": "", "status": "SUCCESS", "durationMillis": 0 },
+            { "id": "11", "name": "Deploy", "durationMillis": null }
+          ]
+        }"####;
+        let stages = parse_wfapi_stages(serde_json::from_str(raw).expect("解析 wfapi 响应"));
+
+        assert_eq!(
+            stages.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["Build", "Test", "Deploy"],
+            "没有名字的条目（并行块的壳）应当被丢掉"
+        );
+        assert_eq!(stages[0].duration_secs, 5, "5228ms 应当换算成 5 秒");
+        assert_eq!(stages[1].name, "Test", "阶段名两侧空格应当去掉");
+        assert_eq!(stages[1].status, "UNKNOWN", "status 为 null 时给占位值");
+        assert_eq!(stages[2].status, "UNKNOWN", "status 缺省时给占位值");
+        assert_eq!(stages[2].duration_secs, 0);
+    }
+
+    #[test]
+    fn pass_on_stage_matches_case_insensitively() {
+        let stages = vec![
+            stage("Checkout", "SUCCESS"),
+            stage("Deploy", "SUCCESS"),
+            stage("Verify", "IN_PROGRESS"),
+        ];
+        assert!(stage_succeeded(&stages, "deploy"));
+        assert!(stage_succeeded(&stages, "  Deploy "));
+        // 回报的是 Jenkins 里实际的写法，不是用户手输的那份。
+        assert_eq!(
+            matched_success_stage(&stages, "deploy").map(|s| s.name.as_str()),
+            Some("Deploy")
+        );
+        assert!(matched_success_stage(&stages, "nope").is_none());
+        assert!(!stage_succeeded(&stages, "Verify"), "还在跑的阶段不算成功");
+        assert!(!stage_succeeded(&stages, "Nope"), "没有的阶段不算成功");
+        assert!(!stage_succeeded(&stages, ""), "空目标不该放行");
+    }
+
+    #[test]
+    fn pass_on_stage_requires_success_status() {
+        assert!(!stage_succeeded(&[stage("Deploy", "FAILED")], "Deploy"));
+        assert!(!stage_succeeded(&[stage("Deploy", "ABORTED")], "Deploy"));
+        // 重名阶段里只要有一条成功就算数。
+        assert!(stage_succeeded(
+            &[stage("Deploy", "ABORTED"), stage("Deploy", "SUCCESS")],
+            "Deploy"
+        ));
+    }
+
+    #[test]
+    fn current_stage_prefers_the_running_one() {
+        let stages = vec![
+            stage("Checkout", "SUCCESS"),
+            stage("Deploy", "IN_PROGRESS"),
+            stage("Verify", "NOT_EXECUTED"),
+        ];
+        assert_eq!(
+            current_stage(&stages).map(|s| s.name.as_str()),
+            Some("Deploy")
+        );
+        // 没有进行中的就退回最后一个有结论的，界面始终有进度可显示。
+        let stages = vec![
+            stage("Checkout", "SUCCESS"),
+            stage("Deploy", "SUCCESS"),
+            stage("Verify", "NOT_EXECUTED"),
+        ];
+        assert_eq!(
+            current_stage(&stages).map(|s| s.name.as_str()),
+            Some("Deploy")
+        );
+        assert_eq!(current_stage(&[]).map(|s| s.name.as_str()), None);
+    }
+
+    #[test]
+    fn stage_waiting_for_input_is_still_current() {
+        let stages = vec![
+            stage("Deploy", "PAUSED_PENDING_INPUT"),
+            stage("Verify", "NOT_EXECUTED"),
+        ];
+        assert_eq!(
+            current_stage(&stages).map(|s| s.name.as_str()),
+            Some("Deploy")
+        );
+    }
+
+    #[test]
+    fn missing_stage_view_reason_mentions_the_plugin() {
+        let reason = stage_unavailable_reason(&JenkinsError::NotFound(
+            "构建 demo#1 的阶段列表".to_string(),
+        ));
+        assert!(
+            reason.contains("Pipeline Stage View"),
+            "404 应当提示插件没装，实际：{reason}"
         );
     }
 }

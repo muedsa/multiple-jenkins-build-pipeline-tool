@@ -34,6 +34,13 @@ pub struct StageConfig {
     /// 默认 `false`：只把本级标为失败，后续级照样往下推进。
     #[serde(default)]
     pub abort_on_failure: bool,
+    /// 「命中即放行」的 stage 名。填 Jenkins Pipeline 里某个 stage 的名字后，
+    /// 该 stage 一成功本级就算成功，**不等它后面的 stage 跑完**就进入下一级。
+    /// 留空表示按整条构建的结果判定。
+    ///
+    /// 注意：这只是不再等 Jenkins，Jenkins 上的构建会继续跑完，工具不会去中断它。
+    #[serde(default)]
+    pub pass_on_stage: String,
 }
 
 fn default_poll_interval() -> u64 {
@@ -54,6 +61,7 @@ impl StageConfig {
             poll_interval_secs: default_poll_interval(),
             timeout_minutes: default_build_timeout(),
             abort_on_failure: false,
+            pass_on_stage: String::new(),
         }
     }
 
@@ -67,6 +75,7 @@ impl StageConfig {
         self.name = self.name.trim().to_string();
         self.base_url = self.base_url.trim().to_string();
         self.username = self.username.trim().to_string();
+        self.pass_on_stage = self.pass_on_stage.trim().to_string();
         if self.poll_interval_secs == 0 {
             self.poll_interval_secs = default_poll_interval();
         }
@@ -269,6 +278,9 @@ struct RawStage {
     timeout_minutes: Option<u64>,
     #[serde(default)]
     abort_on_failure: bool,
+    /// 旧文件里没有这一项，缺省即「不按 stage 提前放行」。
+    #[serde(default)]
+    pass_on_stage: String,
 }
 
 impl RawStage {
@@ -293,6 +305,7 @@ impl RawStage {
             stage.timeout_minutes = v;
         }
         stage.abort_on_failure = self.abort_on_failure;
+        stage.pass_on_stage = self.pass_on_stage;
         stage
     }
 }
@@ -528,6 +541,36 @@ mod tests {
         config.normalize();
         assert_eq!(config.stages[0].poll_interval_secs, 5);
         assert_eq!(config.stages[0].timeout_minutes, 90);
+    }
+
+    /// 「命中即放行」这个新字段：旧文件里没有它要照样能读，保存后能读回来，
+    /// 并且两侧空格会被规范化掉。
+    #[test]
+    fn pass_on_stage_round_trips_and_defaults_to_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "jbt-pass-stage-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+
+        std::fs::write(
+            dir.join("config.json"),
+            r####"{"stages":[{"name":"dev","baseUrl":"http://d","username":"u"}]}"####,
+        )
+        .expect("写配置");
+
+        let store = ConfigStore::load(&dir);
+        let mut config = store.get().expect("读配置");
+        assert_eq!(config.stages[0].pass_on_stage, "", "缺字段应当默认为空");
+
+        config.stages[0].pass_on_stage = "  Deploy ".to_string();
+        store.replace(config).expect("保存配置");
+
+        let reread = ConfigStore::load(&dir).get().expect("再读一次");
+        assert_eq!(reread.stages[0].pass_on_stage, "Deploy");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 真正走一遍「从磁盘读旧配置」的路径，确保老用户升级后
