@@ -1,0 +1,87 @@
+# 推送后打包 Windows 安装程序，并把 src-tauri/target/release/bundle 下的产物传上来。
+# 打 v* 标签时额外把这些产物挂到 GitHub Release。
+
+name: 构建安装包
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  # 允许在 Actions 页面手动触发一次。
+  workflow_dispatch:
+
+# 同一分支上新的推送会取消还在跑的旧构建，Windows 打包不便宜。
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+# gh release create 需要写权限（仅打标签的那一步会真的用到）。
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows 打包
+    runs-on: windows-latest
+
+    # 统一用 bash，方便多行命令与通配符（Windows 默认是 PowerShell）。
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # 故意不写 version：action 会读 package.json 里的 packageManager 字段，
+      # 这样本地和 CI 用的是同一个 pnpm 版本（升级 pnpm 时改那一个地方即可）。
+      - name: 启用 pnpm
+        uses: pnpm/action-setup@v6
+
+      # cache: pnpm 要求 pnpm 先装好，所以必须排在 action-setup 之后。
+      - name: 准备 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      # 注意：这个 action 的 ref 表示「装哪个 Rust 工具链」，不是 action 版本号，
+      # 所以这里必须是 stable（官方 README 的写法），不能替换成 @v1 这类版本标签。
+      - name: 准备 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      # 缓存 cargo 的下载目录与编译中间产物，避免每次从零编译依赖。
+      - name: 缓存 cargo 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      # tauri build 会先执行 beforeBuildCommand（tsc + vite build），
+      # 前端不用单独再构建一次。
+      - name: 构建安装包
+        run: pnpm tauri build
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-bundles
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          # 产物没生成时让任务失败，而不是悄悄传一个空包。
+          if-no-files-found: error
+          retention-days: 30
+
+      # 只有推 v* 标签才发 Release；普通推送只留上面的构建产物。
+      - name: 发布到 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --generate-notes \
+            src-tauri/target/release/bundle/nsis/*.exe \
+            src-tauri/target/release/bundle/msi/*.msi
